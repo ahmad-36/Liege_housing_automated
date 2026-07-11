@@ -1,0 +1,4 @@
+# Never commit data or secrets
+*.json
+__pycache__/
+*.pyc
