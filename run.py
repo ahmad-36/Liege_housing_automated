@@ -32,16 +32,16 @@ CREDS_FILE = SCRIPT_DIR / "credentials.json"
 LISTING_TYPES = ["kots", "studios", "kots-chez-l-habitant", "colocations", "nouvelles"]
 MAX_PAGES = 20
 
-MESSAGE = """Bonjour,
+MESSAGE_FILE = SCRIPT_DIR / "message.txt"
 
-Je m'appelle Ahmad et je suis étudiant. Je viens à Liège pour un semestre d'échange et je cherche une chambre de septembre à janvier.
+if MESSAGE_FILE.exists():
+    MESSAGE = MESSAGE_FILE.read_text().strip()
+else:
+    MESSAGE = """Bonjour,
 
-Pourriez-vous me faire savoir si la chambre est encore disponible ? Est-il également possible d'y domicilier mon adresse officielle ?
+Je suis étudiant et je cherche une chambre à Liège. Pourriez-vous me faire savoir si la chambre est encore disponible ?
 
-Si vous souhaitez me contacter, voici mon numéro WhatsApp : +49 1781525635.
-
-Cordialement,
-Ahmad"""
+Cordialement"""
 
 
 # ── Persistent contacted log ──────────────────────────────────────────
