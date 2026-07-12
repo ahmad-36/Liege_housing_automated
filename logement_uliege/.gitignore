@@ -1,0 +1,8 @@
+# Never commit data or personal info
+*.json
+message.txt
+whatsapp.html
+wa_profile/
+wa_qr.png
+__pycache__/
+*.pyc
