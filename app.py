@@ -527,9 +527,22 @@ with tab_kota:
         has_kota_creds = has_kota_creds or bool(
             load_json(KOTALIEGE_DIR / "credentials.json", {}).get("email"))
     if not has_kota_creds:
-        st.warning("No KotaLiège login saved for this profile — add it in the "
-                   "**🔑 Credentials** tab (register free at kotaliege.be). "
-                   "Dry runs work without it.")
+        st.warning("Messages are sent from **your own KotaLiège account** — "
+                   "log in once below. No account yet? Register free at "
+                   "[kotaliege.be](https://www.kotaliege.be/_register_) first. "
+                   "(Dry runs work without logging in.)")
+        with st.form("kota_login_inline"):
+            ik_col1, ik_col2 = st.columns(2)
+            ik_email = ik_col1.text_input("KotaLiège email")
+            ik_pass = ik_col2.text_input("KotaLiège password", type="password")
+            if st.form_submit_button("🔐 Log in to KotaLiège", type="primary"):
+                if not ik_email or not ik_pass:
+                    st.error("Please fill in both fields.")
+                else:
+                    write_env(paths["env"],
+                              {"KOTALIEGE_EMAIL": ik_email, "KOTALIEGE_PASSWORD": ik_pass})
+                    persist("credentials")
+                    st.rerun()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -539,7 +552,8 @@ with tab_kota:
     with col2:
         confirm = st.checkbox("I understand this sends real messages to landlords")
         if st.button("🚀 Scrape & send messages", type="primary",
-                     width="stretch", disabled=not confirm):
+                     width="stretch", disabled=not confirm or not has_kota_creds,
+                     help=None if has_kota_creds else "Log in to KotaLiège above first"):
             run_with_status("Live run — kotaliege.be", KOTALIEGE_DIR / "run.py", [], paths)
 
     st.divider()
