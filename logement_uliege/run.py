@@ -17,6 +17,7 @@ Usage:
 
 import html
 import json
+import os
 import re
 import sys
 import time
@@ -27,21 +28,32 @@ import requests
 
 BASE_URL = "https://logement.uliege.be"
 SCRIPT_DIR = Path(__file__).parent
-PROCESSED_FILE = SCRIPT_DIR / "processed.json"
-CONTACTS_FILE = SCRIPT_DIR / "new_contacts.json"
+
+# Per-user profiles: when the Streamlit UI (app.py) runs this script for a
+# profile, LIEGE_PROFILE_DIR points at that user's folder and all state /
+# config files live there. Without it (plain CLI use), the original
+# single-user files next to the script are used.
+PROFILE_DIR = (Path(os.environ["LIEGE_PROFILE_DIR"])
+               if os.environ.get("LIEGE_PROFILE_DIR") else None)
+
+PROCESSED_FILE = PROFILE_DIR / "uliege_processed.json" if PROFILE_DIR else SCRIPT_DIR / "processed.json"
+CONTACTS_FILE = PROFILE_DIR / "uliege_new_contacts.json" if PROFILE_DIR else SCRIPT_DIR / "new_contacts.json"
 
 REQUEST_DELAY = 1.0  # seconds between HTTP requests — be polite to the server
 MAX_PAGES = 60       # safety cap
 
-# ── Search criteria — edit these ─────────────────────────────────────
-# Set a value to filter, or None to accept everything.
+# ── Search criteria ──────────────────────────────────────────────────
+# Set a value to filter, or None to accept everything. Defaults below;
+# a search_config.json at the repo root (written by the Streamlit UI,
+# app.py) overrides them.
 
 SEARCH = {
     # Campus checkboxes sent to the site: G=Gembloux, L=Liège centre-ville,
     # S=Sart Tilman, A=Arlon
     "campus": ["L", "S"],
 
-    # Max total cost in € (rent + charges when charges are known)
+    # Total cost range in € (rent + charges when charges are known)
+    "min_total": None,
     "max_total": 500,
 
     # Housing types to keep: subset of {"Appartement", "Chambre", "Maison", "Studio"}
@@ -61,6 +73,37 @@ SEARCH = {
     # distance are kept)
     "max_distance_center_m": None,   # e.g. 3000
 }
+
+CONFIG_FILE = PROFILE_DIR / "search_config.json" if PROFILE_DIR else SCRIPT_DIR.parent / "search_config.json"
+
+
+def _apply_config_file():
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        print(f"WARNING: could not read {CONFIG_FILE}, using defaults")
+        return
+    if "min_total" in cfg:
+        SEARCH["min_total"] = cfg["min_total"]
+    if "max_total" in cfg:
+        SEARCH["max_total"] = cfg["max_total"]
+    if cfg.get("campus"):
+        SEARCH["campus"] = cfg["campus"]
+    if "types" in cfg:
+        SEARCH["types"] = set(cfg["types"]) if cfg["types"] else None
+    if "occupation" in cfg:
+        SEARCH["occupation"] = cfg["occupation"] or None
+    if "domiciliation_required" in cfg:
+        SEARCH["domiciliation"] = True if cfg["domiciliation_required"] else None
+    if "short_stay" in cfg:
+        SEARCH["short_stay"] = True if cfg["short_stay"] else None
+    if "max_distance_center_m" in cfg:
+        SEARCH["max_distance_center_m"] = cfg["max_distance_center_m"]
+
+
+_apply_config_file()
 
 
 # ── Persistent processed log ──────────────────────────────────────────
@@ -229,6 +272,8 @@ def scrape_all(session: requests.Session) -> list[Listing]:
 def matches(l: Listing) -> bool:
     s = SEARCH
     if s["max_total"] is not None and l.total is not None and l.total > s["max_total"]:
+        return False
+    if s["min_total"] is not None and l.total is not None and l.total < s["min_total"]:
         return False
     if s["types"] is not None and not any(t.lower() in l.title.lower() for t in s["types"]):
         return False

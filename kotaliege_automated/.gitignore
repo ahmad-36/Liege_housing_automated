@@ -3,3 +3,5 @@
 message.txt
 __pycache__/
 *.pyc
+# Debug snapshots — contain personal conversation data
+*.html

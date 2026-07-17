@@ -1,0 +1,9 @@
+# Secrets & personal settings — never commit
+.env
+search_config.json
+
+# Per-user profile data (credentials, contact history) — never commit
+profiles/
+
+__pycache__/
+*.pyc

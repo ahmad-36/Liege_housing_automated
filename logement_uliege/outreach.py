@@ -25,6 +25,7 @@ Usage:
 
 import html
 import json
+import os
 import re
 import smtplib
 import sys
@@ -35,10 +36,38 @@ from pathlib import Path
 from urllib.parse import quote
 
 SCRIPT_DIR = Path(__file__).parent
-PROCESSED_FILE = SCRIPT_DIR / "processed.json"
-MESSAGE_FILE = SCRIPT_DIR / "message.txt"
+
+# Per-user profiles: when the Streamlit UI (app.py) runs this script for a
+# profile, LIEGE_PROFILE_DIR points at that user's folder.
+PROFILE_DIR = (Path(os.environ["LIEGE_PROFILE_DIR"])
+               if os.environ.get("LIEGE_PROFILE_DIR") else None)
+
+PROCESSED_FILE = PROFILE_DIR / "uliege_processed.json" if PROFILE_DIR else SCRIPT_DIR / "processed.json"
+MESSAGE_FILE = PROFILE_DIR / "uliege_message.txt" if PROFILE_DIR else SCRIPT_DIR / "message.txt"
+WHATSAPP_FILE = PROFILE_DIR / "whatsapp.html" if PROFILE_DIR else SCRIPT_DIR / "whatsapp.html"
 EMAIL_CREDS_FILE = SCRIPT_DIR / "email_credentials.json"
-WHATSAPP_FILE = SCRIPT_DIR / "whatsapp.html"
+
+# Credentials can also come from a .env file at the repo root:
+#   GMAIL_ADDRESS=... / GMAIL_APP_PASSWORD=... / GMAIL_DISPLAY_NAME=...
+# Profile runs get their credentials injected by app.py instead — never
+# fall back to the owner's .env / email_credentials.json for a profile.
+if PROFILE_DIR is None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(SCRIPT_DIR.parent / ".env")
+    except ImportError:
+        pass
+
+
+def load_email_creds() -> dict:
+    creds = {}
+    if PROFILE_DIR is None and EMAIL_CREDS_FILE.exists():
+        creds = json.loads(EMAIL_CREDS_FILE.read_text())
+    return {
+        "email": os.environ.get("GMAIL_ADDRESS") or creds.get("email"),
+        "app_password": os.environ.get("GMAIL_APP_PASSWORD") or creds.get("app_password"),
+        "display_name": os.environ.get("GMAIL_DISPLAY_NAME") or creds.get("display_name", ""),
+    }
 
 EMAIL_SUBJECT = "Recherche de logement étudiant — votre annonce ULiège (ref {ref})"
 EMAIL_DELAY = 5  # seconds between emails — don't look like a spammer
@@ -98,12 +127,10 @@ def send_emails(records: list[dict], message: str, dry_run: bool):
                   f" ({group[0]['contact'].get('name', '?')}) — refs: {refs}")
         return
 
-    if not EMAIL_CREDS_FILE.exists():
-        print("  SKIPPED: no email_credentials.json (see header of this script).")
-        return
-    creds = json.loads(EMAIL_CREDS_FILE.read_text())
+    creds = load_email_creds()
     if not creds.get("email") or not creds.get("app_password"):
-        print("  SKIPPED: email_credentials.json is incomplete.")
+        print("  SKIPPED: no Gmail credentials. Set GMAIL_ADDRESS / GMAIL_APP_PASSWORD"
+              " in the .env file (or fill in email_credentials.json).")
         return
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:

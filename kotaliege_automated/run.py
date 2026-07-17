@@ -4,7 +4,8 @@ KotaLiege Auto-Messenger — run this anytime to catch & message new listings.
 How it works:
   1. Loads contacted.json (persistent log of every listing already handled)
   2. Scrapes all listing types across all pages
-  3. Filters by criteria (budget ≤500€, domicile OK, available Aug/Sep 2026+)
+  3. Filters by criteria (budget, domiciliation, availability — defaults below,
+     overridable via search_config.json at the repo root / the Streamlit UI)
   4. Skips any listing already in contacted.json
   5. Messages new listings via the platform
   6. Updates contacted.json with results
@@ -16,6 +17,7 @@ Usage:
 
 import asyncio
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -25,14 +27,54 @@ from playwright.async_api import async_playwright, Page
 
 BASE_URL = "https://www.kotaliege.be"
 SCRIPT_DIR = Path(__file__).parent
-STATE_FILE = SCRIPT_DIR / "session_state.json"
-CONTACTED_FILE = SCRIPT_DIR / "contacted.json"
+
+# Per-user profiles: when the Streamlit UI (app.py) runs this script for a
+# profile, LIEGE_PROFILE_DIR points at that user's folder and all state /
+# config / message files live there. Without it (plain CLI use), the
+# original single-user files next to the script are used.
+PROFILE_DIR = (Path(os.environ["LIEGE_PROFILE_DIR"])
+               if os.environ.get("LIEGE_PROFILE_DIR") else None)
+
+STATE_FILE = PROFILE_DIR / "kotaliege_session.json" if PROFILE_DIR else SCRIPT_DIR / "session_state.json"
+CONTACTED_FILE = PROFILE_DIR / "kotaliege_contacted.json" if PROFILE_DIR else SCRIPT_DIR / "contacted.json"
 CREDS_FILE = SCRIPT_DIR / "credentials.json"
+
+# Credentials can also come from a .env file at the repo root:
+#   KOTALIEGE_EMAIL=... / KOTALIEGE_PASSWORD=...
+# Profile runs get their credentials injected by app.py instead — never
+# fall back to the owner's .env / credentials.json for another profile.
+if PROFILE_DIR is None:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(SCRIPT_DIR.parent / ".env")
+    except ImportError:
+        pass
 
 LISTING_TYPES = ["kots", "studios", "kots-chez-l-habitant", "colocations", "nouvelles"]
 MAX_PAGES = 20
 
-MESSAGE_FILE = SCRIPT_DIR / "message.txt"
+# ── Search criteria ───────────────────────────────────────────────────
+# Defaults below; a search_config.json at the repo root (written by the
+# Streamlit UI, app.py) overrides them.
+
+CONFIG = {
+    "min_total": None,               # € rent + charges; None → no floor
+    "max_total": 500,                # € rent + charges; None → no cap
+    "domiciliation_required": True,  # skip listings that refuse domiciliation
+    "available_from": "2026-08-01",  # keep listings available on/after this date
+}
+
+CONFIG_FILE = PROFILE_DIR / "search_config.json" if PROFILE_DIR else SCRIPT_DIR.parent / "search_config.json"
+if CONFIG_FILE.exists():
+    try:
+        _cfg = json.loads(CONFIG_FILE.read_text())
+        CONFIG.update({k: _cfg[k] for k in CONFIG if k in _cfg})
+    except (json.JSONDecodeError, OSError):
+        print(f"WARNING: could not read {CONFIG_FILE}, using defaults")
+
+AVAILABLE_FROM = datetime.strptime(CONFIG["available_from"], "%Y-%m-%d")
+
+MESSAGE_FILE = PROFILE_DIR / "kotaliege_message.txt" if PROFILE_DIR else SCRIPT_DIR / "message.txt"
 
 if MESSAGE_FILE.exists():
     MESSAGE = MESSAGE_FILE.read_text().strip()
@@ -89,7 +131,7 @@ def is_available_ok(text: str) -> bool:
     dt = parse_date_text(text)
     if dt is None:
         return True
-    return dt >= datetime(2026, 8, 1)
+    return dt >= AVAILABLE_FROM
 
 
 def is_domicile_ok(text: str) -> bool:
@@ -222,19 +264,20 @@ async def ensure_logged_in(page: Page, context) -> bool:
         return True
 
     print("Session expired, logging in...")
-    if not CREDS_FILE.exists():
-        print("ERROR: No credentials.json found. Fill in email/password and retry.")
-        return False
-
-    creds = json.loads(CREDS_FILE.read_text())
-    if not creds.get("email") or not creds.get("password"):
-        print("ERROR: credentials.json is empty. Fill in email/password and retry.")
+    creds = {}
+    if PROFILE_DIR is None and CREDS_FILE.exists():
+        creds = json.loads(CREDS_FILE.read_text())
+    email = os.environ.get("KOTALIEGE_EMAIL") or creds.get("email")
+    password = os.environ.get("KOTALIEGE_PASSWORD") or creds.get("password")
+    if not email or not password:
+        print("ERROR: No credentials found. Set KOTALIEGE_EMAIL / KOTALIEGE_PASSWORD"
+              " in the .env file (or fill in credentials.json) and retry.")
         return False
 
     await page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=30000)
     await page.wait_for_timeout(2000)
-    await page.fill('input[name="email"]', creds["email"])
-    await page.fill('input[name="password"]', creds["password"])
+    await page.fill('input[name="email"]', email)
+    await page.fill('input[name="password"]', password)
     await page.click('button[type="submit"]')
     await page.wait_for_timeout(3000)
 
@@ -340,9 +383,13 @@ async def main():
         # Filter
         eligible = []
         for l in all_listings:
-            if l.total is not None and l.total > 500:
+            if (CONFIG["max_total"] is not None and l.total is not None
+                    and l.total > CONFIG["max_total"]):
                 continue
-            if not is_domicile_ok(l.domiciliation):
+            if (CONFIG["min_total"] is not None and l.total is not None
+                    and l.total < CONFIG["min_total"]):
+                continue
+            if CONFIG["domiciliation_required"] and not is_domicile_ok(l.domiciliation):
                 continue
             if not is_available_ok(l.available):
                 continue
