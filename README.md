@@ -7,7 +7,7 @@ Finding accommodation or a "kot" (student room) in Liège is incredibly competit
 ## ✨ Key Features
 
 - **No-Code Web UI:** A [Streamlit](https://streamlit.io) app (`app.py`) to set your search criteria (budget range, campus, domiciliation…), save credentials, run the scrapers and browse results — all from the browser, no code editing needed.
-- **Multi-User Profiles:** Everyone creates their own profile (name + optional access code — no account/email signup needed). Each profile has its own criteria, message templates, credentials and contact history under `profiles/<id>/`, so several people can share one running app without seeing each other's data.
+- **Multi-User Profiles:** Everyone signs up with their email + a password (verified locally — no external auth service). Each profile has its own criteria, message templates, credentials and contact history under `profiles/<id>/`, so several people can share one running app without seeing each other's data.
 - **Automated Scraping:** Regularly scrapes top Belgian student housing platforms — [KotaLiège](https://www.kotaliege.be), the [ULiège housing database](https://logement.uliege.be), and [KotHouse](http://www.kothouse.be) — for every listing in the Liège region.
 - **Automated Outreach:** Sends your message to matching landlords via the platform's contact form, email (Gmail SMTP), or WhatsApp — so you never have to copy-paste again.
 - **Custom Filters:** Filter by total price range (rent + charges), lease duration, domiciliation policy, availability date, and housing type (kots, studios, colocations).
@@ -77,7 +77,7 @@ streamlit run app.py
 
 Then in the browser page that opens:
 
-1. **Create your profile** (or open an existing one) — just a name and an optional access code.
+1. **Sign up** with your name, email and a password (or log in). Profiles created before email login existed can be opened via the expander on the welcome screen and upgraded to email login in the account tab. Note: there is no password-reset email on the free setup — the app owner can clear a forgotten password by editing `profiles/index.json` in the data repo.
 2. **🔑 Credentials tab** — enter your KotaLiège login and (optionally) your Gmail App Password. They're stored only for your profile, never committed to git.
 3. **Sidebar** — set your budget range, campuses, domiciliation and availability date, hit **Save criteria**.
 4. **✉️ Message templates tab** — adjust the message sent to landlords.

@@ -21,9 +21,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -103,7 +104,75 @@ def write_env(path: Path, updates: dict):
 # ── Profiles ──────────────────────────────────────────────────────────
 
 def hash_code(code: str) -> str:
+    # Legacy access-code hash, kept so pre-email profiles still open.
     return hashlib.sha256(code.encode()).hexdigest()
+
+
+def hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 100_000)
+    return salt.hex(), h.hex()
+
+
+def check_password(meta: dict, password: str) -> bool:
+    if not meta.get("pw_hash"):
+        return False
+    _, h = hash_password(password, meta["pw_salt"])
+    return h == meta["pw_hash"]
+
+
+def valid_email(email: str) -> bool:
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.strip()))
+
+
+def find_by_email(index: dict, email: str) -> str | None:
+    email = email.strip().lower()
+    for pid, m in index.items():
+        if m.get("email", "").lower() == email:
+            return pid
+    return None
+
+
+def issue_login_token(index: dict, pid: str):
+    """Stay-logged-in token: stored hashed with a 30-day expiry, put in the
+    URL so revisiting the same address (bookmark/history) skips the login."""
+    tok = secrets.token_urlsafe(24)
+    today = datetime.now().strftime("%Y-%m-%d")
+    meta = index[pid]
+    tokens = {h: e for h, e in meta.get("tokens", {}).items() if e >= today}
+    tokens[hash_code(tok)] = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    meta["tokens"] = dict(list(tokens.items())[-10:])  # keep the 10 newest
+    index[pid] = meta
+    save_index(index)
+    persist("login")
+    st.query_params["t"] = tok
+
+
+def generate_message(who: str, when: str, extra: str, language: str) -> str:
+    """Draft a landlord message with a free hosted model (HF Inference,
+    uses the same HF_TOKEN as the cloud sync)."""
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError("no HF_TOKEN configured in the app secrets")
+    from huggingface_hub import InferenceClient
+    client = InferenceClient(
+        model=os.environ.get("HF_LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"), token=token)
+    out = client.chat_completion(
+        messages=[
+            {"role": "system", "content":
+                "You write short, polite messages from a student to a landlord "
+                "about a housing listing. Output ONLY the message text — no "
+                "subject line, no explanations, no placeholders like [Name]. "
+                "80–120 words. Always ask whether the listing is still "
+                "available and whether a visit (or video call) is possible."},
+            {"role": "user", "content":
+                f"Write the message in {language}.\n"
+                f"About me: {who or 'a student looking for housing in Liège'}.\n"
+                f"Rental period: {when or 'not specified'}.\n"
+                f"Also mention: {extra or 'nothing else'}."},
+        ],
+        max_tokens=400, temperature=0.7)
+    return out.choices[0].message.content.strip()
 
 
 def load_index() -> dict:
@@ -150,21 +219,29 @@ def profile_paths(pid: str, meta: dict) -> dict:
     }
 
 
-def create_profile(index: dict, name: str, code: str) -> str | None:
-    pid = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    if not pid:
-        st.error("Please enter a name.")
+def create_profile(index: dict, name: str, email: str, password: str) -> str | None:
+    if not name.strip():
+        st.error("Please enter your name.")
         return None
-    if pid in index:
-        st.error(f"A profile named “{index[pid]['name']}” already exists — "
-                 "pick another name or open it on the left.")
+    if not valid_email(email):
+        st.error("That doesn't look like a valid email address.")
         return None
+    if find_by_email(index, email):
+        st.error("There is already a profile with this email — log in on the left.")
+        return None
+    if len(password) < 6:
+        st.error("Please choose a password of at least 6 characters.")
+        return None
+    pid = re.sub(r"[^a-z0-9]+", "-", email.strip().lower().split("@")[0]).strip("-")
+    while not pid or pid in index:
+        pid = f"{pid or 'user'}-{os.urandom(2).hex()}"
     d = PROFILES_DIR / pid
     d.mkdir(parents=True, exist_ok=True)
     (d / "kotaliege_message.txt").write_text(DEFAULT_MESSAGE)
     (d / "uliege_message.txt").write_text(DEFAULT_MESSAGE)
-    index[pid] = {"name": name.strip(), "legacy": False,
-                  "code_hash": hash_code(code) if code else None,
+    salt, pw_hash = hash_password(password)
+    index[pid] = {"name": name.strip(), "email": email.strip().lower(),
+                  "legacy": False, "pw_salt": salt, "pw_hash": pw_hash,
                   "created": datetime.now().strftime("%Y-%m-%d")}
     save_index(index)
     return pid
@@ -194,7 +271,7 @@ def run_with_status(label: str, script: Path, args: list[str], paths: dict):
     # Base env stripped of any owner credentials from the shell; the
     # profile's own .env is layered on top.
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("KOTALIEGE_", "GMAIL_"))}
+           if not k.startswith(("KOTALIEGE_", "GMAIL_", "EMAIL_", "SMTP_"))}
     env["PYTHONUNBUFFERED"] = "1"
     env.update(read_env(paths["env"]))
     if paths["dir"] is not None:
@@ -255,6 +332,22 @@ cloud_status = restore_cloud_state() if hf_sync.enabled() else None
 
 index = load_index()
 
+def url_token() -> str | None:
+    t = st.query_params.get("t")
+    if isinstance(t, list):  # some runtimes hand back a list
+        t = t[0] if t else None
+    return t
+
+
+# Stay-logged-in: a valid token in the URL skips the login screen.
+if "profile_id" not in st.session_state and url_token():
+    _th = hash_code(url_token())
+    _today = datetime.now().strftime("%Y-%m-%d")
+    for _pid, _m in index.items():
+        if _m.get("tokens", {}).get(_th, "") >= _today:
+            st.session_state.profile_id = _pid
+            break
+
 if "profile_id" not in st.session_state or st.session_state.profile_id not in index:
     st.title("🏠 Liège Housing Finder")
     st.markdown(
@@ -262,39 +355,60 @@ if "profile_id" not in st.session_state or st.session_state.profile_id not in in
         "[kotaliege.be](https://www.kotaliege.be) and the "
         "[ULiège housing database](https://logement.uliege.be), filters by "
         "**your** criteria, and contacts landlords for you.\n\n"
-        "Pick your profile to continue — or create one, it takes 10 seconds."
+        "Log in to continue — or sign up, it takes 10 seconds."
     )
     col1, col2 = st.columns(2, gap="large")
 
     with col1:
-        st.subheader("Open your profile")
-        sel = st.selectbox("Profile", options=list(index),
-                           format_func=lambda k: index[k]["name"])
-        code_in = st.text_input("Access code", type="password",
-                                help="Leave empty if this profile has no code.")
-        if st.button("➡️ Open", width="stretch"):
-            meta = index[sel]
-            if meta.get("code_hash") and hash_code(code_in) != meta["code_hash"]:
-                st.error("Wrong access code.")
-            else:
-                st.session_state.profile_id = sel
-                st.rerun()
+        st.subheader("Log in")
+        with st.form("login"):
+            log_email = st.text_input("Email")
+            log_pw = st.text_input("Password", type="password")
+            if st.form_submit_button("➡️ Log in", width="stretch"):
+                lpid = find_by_email(index, log_email)
+                if lpid is None:
+                    st.error("No profile with this email — sign up on the right.")
+                elif not check_password(index[lpid], log_pw):
+                    st.error("Wrong password.")
+                else:
+                    st.session_state.profile_id = lpid
+                    issue_login_token(index, lpid)
+                    st.rerun()
 
     with col2:
-        st.subheader("New here? Create a profile")
-        new_name = st.text_input("Your name")
-        new_code = st.text_input("Choose an access code (optional)", type="password",
-                                 help="Protects your profile from others using this app. "
-                                      "Leave empty for no code.")
-        new_code2 = st.text_input("Repeat access code", type="password")
-        if st.button("✨ Create profile", type="primary", width="stretch"):
-            if new_code != new_code2:
-                st.error("The two access codes don't match.")
-            else:
-                pid = create_profile(index, new_name, new_code)
-                if pid:
-                    persist("profile created")
-                    st.session_state.profile_id = pid
+        st.subheader("New here? Sign up")
+        with st.form("signup"):
+            new_name = st.text_input("Your name")
+            new_email = st.text_input("Email")
+            new_pw = st.text_input("Password (min. 6 characters)", type="password")
+            new_pw2 = st.text_input("Repeat password", type="password")
+            if st.form_submit_button("✨ Create profile", type="primary", width="stretch"):
+                if new_pw != new_pw2:
+                    st.error("The two passwords don't match.")
+                else:
+                    npid = create_profile(index, new_name, new_email, new_pw)
+                    if npid:
+                        st.session_state.profile_id = npid
+                        issue_login_token(index, npid)  # also persists
+                        st.rerun()
+
+    # Profiles created before email login existed (no email on file yet)
+    legacy_pids = [k for k, m in index.items() if not m.get("email")]
+    if legacy_pids:
+        with st.expander("Profile created before email login? Open it here"):
+            sel = st.selectbox("Profile", options=legacy_pids,
+                               format_func=lambda k: index[k]["name"])
+            code_in = st.text_input("Access code (leave empty if none was set)",
+                                    type="password")
+            st.caption("Once inside, add your email + password in "
+                       "**🔑 Credentials & account** to switch to email login.")
+            if st.button("➡️ Open", width="stretch"):
+                meta = index[sel]
+                if meta.get("code_hash") and hash_code(code_in) != meta["code_hash"]:
+                    st.error("Wrong access code.")
+                else:
+                    st.session_state.profile_id = sel
+                    issue_login_token(index, sel)
                     st.rerun()
     st.stop()
 
@@ -311,7 +425,13 @@ with st.sidebar:
     st.title("🏠 Liège Housing Finder")
     prof_col, out_col = st.columns([3, 1])
     prof_col.markdown(f"👤 **{meta['name']}**")
-    if out_col.button("Exit", help="Switch profile"):
+    if out_col.button("Exit", help="Log out on this device"):
+        tok = url_token()
+        if tok:  # revoke this device's stay-logged-in token
+            meta.get("tokens", {}).pop(hash_code(tok), None)
+            save_index(index)
+            persist("logout")
+        st.query_params.clear()
         del st.session_state.profile_id
         st.rerun()
 
@@ -453,13 +573,15 @@ with tab_uliege:
 
     st.divider()
     st.subheader("Email outreach")
-    has_gmail = bool(env.get("GMAIL_ADDRESS") and env.get("GMAIL_APP_PASSWORD"))
+    has_email = bool((env.get("EMAIL_ADDRESS") or env.get("GMAIL_ADDRESS"))
+                     and (env.get("EMAIL_PASSWORD") or env.get("GMAIL_APP_PASSWORD")))
     if meta.get("legacy"):
-        has_gmail = has_gmail or bool(
+        has_email = has_email or bool(
             load_json(ULIEGE_DIR / "email_credentials.json", {}).get("email"))
-    if not has_gmail:
-        st.warning("No Gmail credentials saved for this profile — add them in the "
-                   "**🔑 Credentials** tab. Dry runs work without them.")
+    if not has_email:
+        st.warning("No sending email saved for this profile — add one in the "
+                   "**🔑 Credentials** tab (Gmail, Outlook, Yahoo… all work). "
+                   "Dry runs work without it.")
 
     col3, col4 = st.columns(2)
     with col3:
@@ -499,6 +621,41 @@ with tab_msg:
     st.caption("Written in French — that's what Liège landlords expect. "
                "Keep it short, add your name and dates, and ask about "
                "domiciliation if you need it.")
+
+    with st.expander("✨ Let AI write it for you (free)"):
+        c1, c2 = st.columns(2)
+        ai_who = c1.text_input("Who are you?",
+                               placeholder="e.g. Marie, 22, Erasmus student at ULiège")
+        ai_when = c2.text_input("When / how long?",
+                                placeholder="e.g. September 2026 – January 2027")
+        ai_extra = st.text_input(
+            "Anything else to mention?",
+            placeholder="e.g. non-smoker, need domiciliation, WhatsApp +32 ...")
+        ai_lang = st.selectbox("Language", ["French (what landlords expect)", "English"])
+        if st.button("✨ Generate draft"):
+            try:
+                with st.spinner("Writing…"):
+                    st.session_state.ai_draft = generate_message(
+                        ai_who, ai_when, ai_extra,
+                        "French" if ai_lang.startswith("French") else "English")
+            except Exception as e:
+                st.error(f"Generation failed ({e}). The free AI quota may be used "
+                         "up for this month — edit the template below by hand instead.")
+        if st.session_state.get("ai_draft"):
+            draft = st.text_area("Draft — edit freely, then apply:",
+                                 value=st.session_state.ai_draft, height=200,
+                                 key="ai_draft_edit")
+            ca, cb = st.columns(2)
+            for col, btn_label, target in [(ca, "⬇️ Use for KotaLiège", "kota_message"),
+                                           (cb, "⬇️ Use for ULiège", "ul_message")]:
+                if col.button(btn_label):
+                    p = paths[target]
+                    p.write_text(draft)
+                    st.session_state[f"msg_{p.parent.name}_{p.name}"] = draft
+                    persist("message")
+                    st.success("Applied to the template below — don't forget to "
+                               "proofread names and dates.")
+
     for label, path in [("KotaLiège contact form", paths["kota_message"]),
                         ("ULiège email / WhatsApp", paths["ul_message"])]:
         text = path.read_text() if path.exists() else DEFAULT_MESSAGE
@@ -529,37 +686,80 @@ with tab_creds:
             persist("credentials")
             st.success("Saved.")
 
-    with st.form("creds_gmail"):
-        st.markdown("**Gmail (for ULiège outreach)** — create an *App Password* at "
-                    "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) "
-                    "(requires 2-step verification; your normal password will NOT work).")
-        g_addr = st.text_input("Gmail address", value=env.get("GMAIL_ADDRESS", ""))
-        g_pass = st.text_input("Gmail app password", type="password",
-                               placeholder="•••••• (saved)" if env.get("GMAIL_APP_PASSWORD") else "")
-        g_name = st.text_input("Display name (shown as email sender)",
-                               value=env.get("GMAIL_DISPLAY_NAME", ""))
-        if st.form_submit_button("💾 Save Gmail credentials"):
-            write_env(paths["env"], {"GMAIL_ADDRESS": g_addr, "GMAIL_APP_PASSWORD": g_pass,
-                                     "GMAIL_DISPLAY_NAME": g_name})
+    with st.form("creds_email"):
+        st.markdown(
+            "**Email for contacting landlords (ULiège outreach)** — Gmail, "
+            "Outlook/Hotmail, Yahoo, iCloud, GMX and web.de are auto-detected; "
+            "any other provider works via the custom SMTP fields. Most providers "
+            "need an **app password**, not your normal one (Gmail: "
+            "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords), "
+            "requires 2-step verification)."
+        )
+        e_addr = st.text_input(
+            "Sender email (defaults to your login email)",
+            value=env.get("EMAIL_ADDRESS") or env.get("GMAIL_ADDRESS")
+                  or meta.get("email", ""))
+        e_pass = st.text_input(
+            "Email app password", type="password",
+            placeholder="•••••• (saved)"
+            if env.get("EMAIL_PASSWORD") or env.get("GMAIL_APP_PASSWORD") else "")
+        e_name = st.text_input(
+            "Display name (shown as email sender)",
+            value=env.get("EMAIL_DISPLAY_NAME") or env.get("GMAIL_DISPLAY_NAME", ""))
+        with st.expander("Custom SMTP (only for providers not auto-detected)"):
+            e_host = st.text_input("SMTP host", value=env.get("SMTP_HOST", ""))
+            e_port = st.text_input("SMTP port", value=env.get("SMTP_PORT", ""))
+            e_tls = st.checkbox("Use STARTTLS (usually port 587; unticked = SSL, port 465)",
+                                value=env.get("SMTP_STARTTLS") == "1")
+        if st.form_submit_button("💾 Save email settings"):
+            write_env(paths["env"], {
+                "EMAIL_ADDRESS": e_addr, "EMAIL_PASSWORD": e_pass,
+                "EMAIL_DISPLAY_NAME": e_name,
+                "SMTP_HOST": e_host, "SMTP_PORT": e_port,
+                "SMTP_STARTTLS": "1" if e_tls else "0",
+            })
             persist("credentials")
             st.success("Saved.")
 
     st.divider()
-    st.subheader("Account")
-    with st.form("access_code"):
-        st.markdown(f"**Profile:** {meta['name']} — "
-                    + ("🔒 protected by an access code"
-                       if meta.get("code_hash") else "🔓 no access code set"))
-        old_code = st.text_input("Current access code", type="password",
-                                 disabled=not meta.get("code_hash"))
-        new_code = st.text_input("New access code (empty = remove the code)",
-                                 type="password")
-        if st.form_submit_button("💾 Change access code"):
-            if meta.get("code_hash") and hash_code(old_code) != meta["code_hash"]:
-                st.error("Current access code is wrong.")
+    st.subheader("Account — email login")
+    with st.form("account"):
+        if meta.get("email"):
+            st.markdown(f"**Profile:** {meta['name']} — logs in as `{meta['email']}` 🔒")
+        else:
+            st.markdown(f"**Profile:** {meta['name']} — ⚠️ no email login yet. "
+                        "Add an email and password below to log in with them "
+                        "next time.")
+        a_email = st.text_input("Login email", value=meta.get("email", ""))
+        a_pw = st.text_input("New password (min. 6 characters, empty = keep current)",
+                             type="password")
+        a_current = st.text_input(
+            "Current password — or access code, for profiles created before "
+            "email login", type="password",
+            disabled=not (meta.get("pw_hash") or meta.get("code_hash")))
+        if st.form_submit_button("💾 Save login details"):
+            authorized = (
+                (not meta.get("pw_hash") and not meta.get("code_hash"))
+                or check_password(meta, a_current)
+                or (meta.get("code_hash") and hash_code(a_current) == meta["code_hash"])
+            )
+            other = find_by_email(index, a_email)
+            if not authorized:
+                st.error("Current password / access code is wrong.")
+            elif not valid_email(a_email):
+                st.error("That doesn't look like a valid email address.")
+            elif other is not None and other != pid:
+                st.error("Another profile already uses this email.")
+            elif not a_pw and not meta.get("pw_hash"):
+                st.error("Please set a password — it's required for email login.")
+            elif a_pw and len(a_pw) < 6:
+                st.error("Please choose a password of at least 6 characters.")
             else:
-                meta["code_hash"] = hash_code(new_code) if new_code else None
+                meta["email"] = a_email.strip().lower()
+                if a_pw:
+                    meta["pw_salt"], meta["pw_hash"] = hash_password(a_pw)
+                meta.pop("code_hash", None)  # superseded by email login
                 index[pid] = meta
                 save_index(index)
-                persist("access code")
-                st.success("Access code updated.")
+                persist("account")
+                st.success(f"Saved — log in as {meta['email']} from now on.")
